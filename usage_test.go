@@ -72,7 +72,7 @@ Options:
 	args.Value = 42
 	args.Values = []float64{3.14, 42, 256}
 	args.File = &NameDotName{"scratch", "txt"}
-	p, err := NewParser(Config{"example"}, &args)
+	p, err := NewParser(Config{Program:"example"}, &args)
 	require.NoError(t, err)
 
 	os.Args[0] = "example"
@@ -112,7 +112,7 @@ Options:
 	}
 	v := MyEnum(42)
 	args.Name = &v
-	p, err := NewParser(Config{"example"}, &args)
+	p, err := NewParser(Config{Program:"example"}, &args)
 
 	// NB: some might might expect there to be an error here
 	require.NoError(t, err)

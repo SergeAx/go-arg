@@ -76,7 +76,10 @@ func flags() []string {
 // Config represents configuration options for an argument parser
 type Config struct {
 	Program string // Program is the name of the program used in the help text
+	NameSpaceDelimiter string // namespace.value or namespace_value?
 }
+
+const defaultDelimiter = "."
 
 // Parser represents a set of command line options with destination values
 type Parser struct {
@@ -103,20 +106,46 @@ type Described interface {
 }
 
 // walkFields calls a function for each field of a struct, recursively expanding struct fields.
-func walkFields(v reflect.Value, visit func(field reflect.StructField, val reflect.Value, owner reflect.Type) bool) {
+func walkFields(parser *Parser, v reflect.Value, prefix string, visit func (reflect.StructField, reflect.Type) (spec, string)) (errs []string) {
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		val := v.Field(i)
-		expand := visit(field, val, t)
-		if expand && field.Type.Kind() == reflect.Struct {
-			walkFields(val, visit)
+		spec, err := visit(field, t)
+		if err != "" {
+			errs = append(errs, err)
+		}
+		if spec.long != "" {
+			spec.dest = val
+			parser.spec = append(parser.spec, &spec)
+		}
+		if field.Type.Kind() == reflect.Struct {
+			var nestedPrefix string
+			if field.Anonymous {
+				nestedPrefix = ""
+			} else {
+				nestedPrefix = spec.long
+			}
+			nestedErrs := walkFields(parser, val, nestedPrefix, visit)
+			errs = append(errs, nestedErrs...)
 		}
 	}
+
+	if prefix != "" {
+		prefix = prefix + parser.config.NameSpaceDelimiter
+	}
+	for _, s := range parser.spec {
+		s.long = prefix + s.long
+	}
+
+	return
 }
 
 // NewParser constructs a parser from a list of destination structs
 func NewParser(config Config, dests ...interface{}) (*Parser, error) {
+	if config.NameSpaceDelimiter == "" {
+		config.NameSpaceDelimiter = defaultDelimiter
+	}
 	p := Parser{
 		config: config,
 	}
@@ -136,89 +165,7 @@ func NewParser(config Config, dests ...interface{}) (*Parser, error) {
 			panic(fmt.Sprintf("%T is not a struct pointer", dest))
 		}
 
-		var errs []string
-		walkFields(v, func(field reflect.StructField, val reflect.Value, t reflect.Type) bool {
-			// Check for the ignore switch in the tag
-			tag := field.Tag.Get("arg")
-			if tag == "-" {
-				return false
-			}
-
-			// If this is an embedded struct then recurse into its fields
-			if field.Anonymous && field.Type.Kind() == reflect.Struct {
-				return true
-			}
-
-			spec := spec{
-				long: strings.ToLower(field.Name),
-				dest: val,
-			}
-
-			help, exists := field.Tag.Lookup("help")
-			if exists {
-				spec.help = help
-			}
-
-			// Check whether this field is supported. It's good to do this here rather than
-			// wait until ParseValue because it means that a program with invalid argument
-			// fields will always fail regardless of whether the arguments it received
-			// exercised those fields.
-			var parseable bool
-			parseable, spec.boolean, spec.multiple = canParse(field.Type)
-			if !parseable {
-				errs = append(errs, fmt.Sprintf("%s.%s: %s fields are not supported",
-					t.Name(), field.Name, field.Type.String()))
-				return false
-			}
-
-			// Look at the tag
-			if tag != "" {
-				for _, key := range strings.Split(tag, ",") {
-					key = strings.TrimLeft(key, " ")
-					var value string
-					if pos := strings.Index(key, ":"); pos != -1 {
-						value = key[pos+1:]
-						key = key[:pos]
-					}
-
-					switch {
-					case strings.HasPrefix(key, "---"):
-						errs = append(errs, fmt.Sprintf("%s.%s: too many hyphens", t.Name(), field.Name))
-					case strings.HasPrefix(key, "--"):
-						spec.long = key[2:]
-					case strings.HasPrefix(key, "-"):
-						if len(key) != 2 {
-							errs = append(errs, fmt.Sprintf("%s.%s: short arguments must be one character only",
-								t.Name(), field.Name))
-							return false
-						}
-						spec.short = key[1:]
-					case key == "required":
-						spec.required = true
-					case key == "positional":
-						spec.positional = true
-					case key == "separate":
-						spec.separate = true
-					case key == "help": // deprecated
-						spec.help = value
-					case key == "env":
-						// Use override name if provided
-						if value != "" {
-							spec.env = value
-						} else {
-							spec.env = strings.ToUpper(field.Name)
-						}
-					default:
-						errs = append(errs, fmt.Sprintf("unrecognized tag '%s' on field %s", key, tag))
-						return false
-					}
-				}
-			}
-			p.spec = append(p.spec, &spec)
-
-			// if this was an embedded field then we already returned true up above
-			return false
-		})
+		errs := walkFields(&p, v, "", field)
 
 		if len(errs) > 0 {
 			return nil, errors.New(strings.Join(errs, "\n"))
@@ -231,6 +178,82 @@ func NewParser(config Config, dests ...interface{}) (*Parser, error) {
 		}
 	}
 	return &p, nil
+}
+
+// Process a field in root or nested arg struct
+func field(field reflect.StructField, t reflect.Type) (s spec, error string) {
+	s = spec{long: ""}
+
+	// Check for the ignore switch in the tag
+	tag := field.Tag.Get("arg")
+	if tag == "-" {
+		return
+	}
+
+	help, exists := field.Tag.Lookup("help")
+	if exists {
+		s.help = help
+	}
+
+	// Check whether this field is supported. It's good to do this here rather than
+	// wait until ParseValue because it means that a program with invalid argument
+	// fields will always fail regardless of whether the arguments it received
+	// exercised those fields.
+	var parseable bool
+	parseable, s.boolean, s.multiple = canParse(field.Type)
+	if !parseable {
+		error = fmt.Sprintf("%s.%s: %s fields are not supported",
+			t.Name(), field.Name, field.Type.String())
+		return
+	}
+
+	s.long = strings.ToLower(field.Name)
+
+	// Look at the tag
+	if tag != "" {
+		for _, key := range strings.Split(tag, ",") {
+			key = strings.TrimLeft(key, " ")
+			var value string
+			if pos := strings.Index(key, ":"); pos != -1 {
+				value = key[pos+1:]
+				key = key[:pos]
+			}
+
+			switch {
+			case strings.HasPrefix(key, "---"):
+				error = fmt.Sprintf("%s.%s: too many hyphens", t.Name(), field.Name)
+			case strings.HasPrefix(key, "--"):
+				s.long = key[2:]
+			case strings.HasPrefix(key, "-"):
+				if len(key) != 2 {
+					error = fmt.Sprintf("%s.%s: short arguments must be one character only",
+						t.Name(), field.Name)
+					return
+				}
+				s.short = key[1:]
+			case key == "required":
+				s.required = true
+			case key == "positional":
+				s.positional = true
+			case key == "separate":
+				s.separate = true
+			case key == "help": // deprecated
+				s.help = value
+			case key == "env":
+				// Use override name if provided
+				if value != "" {
+					s.env = value
+				} else {
+					s.env = strings.ToUpper(field.Name)
+				}
+			default:
+				error = fmt.Sprintf("unrecognized tag '%s' on field %s", key, tag)
+				return
+			}
+		}
+	}
+
+	return
 }
 
 // Parse processes the given command line option, storing the results in the field
@@ -328,7 +351,6 @@ func process(specs []*spec, args []string) error {
 			value = opt[pos+1:]
 			opt = opt[:pos]
 		}
-
 		// lookup the spec for this option
 		spec, ok := optionMap[opt]
 		if !ok {
@@ -369,7 +391,7 @@ func process(specs []*spec, args []string) error {
 				return fmt.Errorf("missing value for %s", arg)
 			}
 			if !nextIsNumeric(spec.dest.Type(), args[i+1]) && isFlag(args[i+1]) {
-				return fmt.Errorf("missing value for %s", arg)
+				return fmt.Errorf("value for %s is missing or of wrong type", arg)
 			}
 			value = args[i+1]
 			i++
@@ -474,6 +496,18 @@ func canParse(t reflect.Type) (parseable, boolean, multiple bool) {
 	parseable = scalar.CanParse(t)
 	boolean = isBoolean(t)
 	if parseable {
+		return
+	}
+
+	// Recursively look inside structures
+	if t.Kind() == reflect.Struct {
+		for i := 0; i < t.NumField(); i++ {
+			t1 := t.Field(i)
+			parseable, boolean, multiple = canParse(t1.Type)
+			if !parseable {
+				return
+			}
+		}
 		return
 	}
 

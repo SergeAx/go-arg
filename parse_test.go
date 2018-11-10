@@ -776,7 +776,7 @@ func TestMailAddr(t *testing.T) {
 	var args struct {
 		Recipient mail.Address
 	}
-	err := parse("--recipient foo@example.com", &args)
+	err := parse("--recipient.address foo@example.com", &args)
 	require.NoError(t, err)
 	assert.Equal(t, "<foo@example.com>", args.Recipient.String())
 }
@@ -932,4 +932,16 @@ func TestSpacesAllowedInTags(t *testing.T) {
 	err := parse("--foo one -f=two --foo=three -f four", &args)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"one", "two", "three", "four"}, args.Foo)
+}
+
+func TestParseNestedStruct(t *testing.T) {
+	var args struct {
+		Foo struct {
+			Bar string
+		}
+	}
+
+	err := parse("--foo.bar baz", &args)
+	require.NoError(t, err)
+	assert.Equal(t, "baz", args.Foo.Bar)
 }
